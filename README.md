@@ -1,6 +1,6 @@
-# Windows API 版: portproxy / Firewall 設定 (C++17)
+# Windows API Version: portproxy / Firewall Configuration (C++17)
 
-`netsh.exe` を起動せず、以下に相当する処理を行う実装です。
+This implementation performs operations equivalent to the following without invoking `netsh.exe`.
 
 ```cmd
 netsh interface portproxy add v4tov4 listenport=8180 connectaddress=x.x.x.x connectport=8080
@@ -9,40 +9,40 @@ netsh interface portproxy delete v4tov4 listenport=8180 listenaddress=0.0.0.0
 netsh advfirewall firewall delete rule name="proxy forward"
 ```
 
-## 構成
+## Structure
 
-- `WindowsNetworkConfig.h`: `INetworkConfiguration` 抽象インターフェースと設定モデル
-- `WindowsNetworkConfig.cpp`: Win32 レジストリ API、SCM API、Windows Firewall COM API を用いた実装
-- `main.cpp`: `add` と `delete` の実行例
-- `CMakeLists.txt`: Windows / MSVC 向けビルド定義
+- `WindowsNetworkConfig.h`: `INetworkConfiguration` abstract interface and configuration model
+- `WindowsNetworkConfig.cpp`: Implementation using Win32 Registry API, SCM API, and Windows Firewall COM API
+- `main.cpp`: Example of executing `add` and `delete`
+- `CMakeLists.txt`: Build definition for Windows / MSVC
 
-## ビルド
+## Build
 
-Visual Studio の Developer PowerShell で以下を実行します。
+In Visual Studio's Developer PowerShell, execute the following:
 
 ```powershell
 cmake -S . -B build -A x64
 cmake --build build --config Release
 ```
 
-または x64 Native Tools Command Prompt for VS から直接:
+Or directly from the x64 Native Tools Command Prompt for VS:
 
 ```cmd
 cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE main.cpp WindowsNetworkConfig.cpp /link advapi32.lib ole32.lib oleaut32.lib ws2_32.lib
 ```
 
-## 実行
+## Execution
 
-**管理者権限**のターミナルで、転送先を実際の IPv4 アドレスに置き換えます。
+In a terminal with **administrator privileges**, replace the destination with the actual IPv4 address.
 
 ```powershell
 .\build\Release\network_rules.exe add 192.0.2.10
 .\build\Release\network_rules.exe delete
 ```
 
-`192.0.2.10` はドキュメント用 IP アドレスの例です。
+`192.0.2.10` is an example IP address for documentation purposes.
 
-## 設定結果の確認
+## Verifying the Configuration Results
 
 ```cmd
 netsh interface portproxy show v4tov4
@@ -50,19 +50,19 @@ netsh advfirewall firewall show rule name="proxy forward"
 netstat -ano | findstr :8180
 ```
 
-## 注意点
+## Important Notes
 
-- PortProxy のレジストリ形式は公開の管理 API ではなく、ProcMon で実測した実装依存形式です。Windows 更新後の互換性保証はありません。
-- `RegSetValueExW` / `RegDeleteValueW` で `HKLM\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp` を変更し、`iphlpsvc` へ `SERVICE_CONTROL_PARAMCHANGE` を送信します。
-- `listenaddress=0.0.0.0` を値名 `*/8180` として正規化します。削除時は古い手動設定 `0.0.0.0/8180` もフォールバックとして扱います。
-- `INetFwRules::Add` は同名ルールを上書きする場合があるため、この実装では `Item` で既存名を検出した場合は例外にします。したがって既存ルールがある場合は `netsh add` と完全には同じ動作になりません。
-- IPv4 アドレスは数値表現のみ対応します（`netsh` が対応するホスト名は非対応）。ポート範囲は 1〜65535 です。
-- PortProxy / Firewall にまたがる完全なトランザクションはありません。Firewall の追加に失敗すると、直前に作成した PortProxy をベストエフォートで削除します。削除は双方を独立に試みます。
-- `ControlService` の成功はサービスへの通知成功を意味し、通信可能性を保証しません。`iphlpsvc` が起動しており、転送先に到達できる必要があります。
-- ルールは全プロファイルの TCP 8180 番への入力を許可し、全 IPv4 インターフェースでリッスンします。外部から到達可能になるため、実環境ではアクセス元アドレスの制限を検討してください。
-- このサンプルは Windows 上でのビルド・実行による検証は未実施です。
+- The registry format for PortProxy is not a publicly documented management API; it is an implementation-dependent format determined by ProcMon. Compatibility after Windows updates is not guaranteed.
+- Modifies `HKLM\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp` using `RegSetValueExW` / `RegDeleteValueW` and sends `SERVICE_CONTROL_PARAMCHANGE` to `iphlpsvc`.
+- Normalizes `listenaddress=0.0.0.0` as the value name `*/8180`. During deletion, it also treats the older manual configuration `0.0.0.0/8180` as a fallback.
+- `INetFwRules::Add` may overwrite rules with the same name; therefore, this implementation throws an exception if an existing name is detected using `Item`. Consequently, it does not behave identically to `netsh add` if an existing rule is present.
+- IPv4 addresses are supported only in numerical representation (`netsh`'s support for hostnames is not supported). The port range is 1 to 65535.
+- There is no complete transaction spanning PortProxy and Firewall. If adding the Firewall rule fails, the PortProxy created immediately before is deleted on a best-effort basis. Deletion is attempted independently for both.
+- The success of `ControlService` indicates that the notification to the service was successful, but does not guarantee connectivity. `iphlpsvc` must be running, and the destination must be reachable.
+- The rule allows inbound TCP traffic on port 8180 for all profiles and listens on all IPv4 interfaces. This makes it accessible from outside, so consider restricting the source address in a production environment.
+- This sample has not been verified by building and running on Windows.
 
-## 根拠
+## References
 
 - [Microsoft: netsh interface portproxy](https://learn.microsoft.com/windows-server/networking/technologies/netsh/netsh-interface-portproxy)
 - [Microsoft: ControlService](https://learn.microsoft.com/windows/win32/api/winsvc/nf-winsvc-controlservice)
