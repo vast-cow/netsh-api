@@ -1,61 +1,37 @@
-# Windows API Version: portproxy / Firewall Configuration (C++17)
+# Windows PortProxy and Firewall Configuration
 
-This implementation performs operations equivalent to the following without invoking `netsh.exe`.
-
-```cmd
-netsh interface portproxy add v4tov4 listenport=8180 connectaddress=x.x.x.x connectport=8080
-netsh advfirewall firewall add rule name="proxy forward" dir=in action=allow protocol=TCP localport=8180
-netsh interface portproxy delete v4tov4 listenport=8180 listenaddress=0.0.0.0
-netsh advfirewall firewall delete rule name="proxy forward"
-```
-
-## Structure
-
-- `WindowsNetworkConfig.h`: `INetworkConfiguration` abstract interface and configuration model
-- `WindowsNetworkConfig.cpp`: Implementation using Win32 Registry API, SCM API, and Windows Firewall COM API
-- `main.cpp`: Command-line interface for `add`, `delete`, and `list`
-- `CMakeLists.txt`: Build definition for Windows / MSVC
+`network_rules` configures IPv4 TCP forwarding and Windows Firewall directly through Windows APIs, without executing `netsh` or PowerShell. It listens on `0.0.0.0:8180`, forwards to port `8080` on the requested destination, and adds an inbound TCP firewall rule named `proxy forward` for all profiles.
 
 ## Build
 
-In Visual Studio's Developer PowerShell, execute the following:
+Install Rust with the Windows x64 MSVC target and the Visual Studio C++ build tools and Windows SDK. From a Windows x64 MSVC terminal, run:
 
 ```powershell
-cmake -S . -B build -A x64
-cmake --build build --config Release
+cargo build --release
 ```
 
-Or directly from the x64 Native Tools Command Prompt for VS:
+The executable is `target\release\network_rules.exe`. `Cargo.lock` pins dependencies; `target/` contains build output.
 
-```cmd
-cl /nologo /std:c++17 /EHsc /W4 /DUNICODE /D_UNICODE main.cpp WindowsNetworkConfig.cpp /link advapi32.lib ole32.lib oleaut32.lib ws2_32.lib
-```
+## Usage
 
-## Execution
-
-In a terminal with **administrator privileges**, replace the destination with the actual IPv4 address.
+Run from an administrator terminal, replacing the example IPv4 address with the actual destination:
 
 ```powershell
-.\build\Release\network_rules.exe add 192.0.2.10
-.\build\Release\network_rules.exe delete
+.\target\release\network_rules.exe add 192.0.2.10
+.\target\release\network_rules.exe list portproxy
+.\target\release\network_rules.exe list firewall
+.\target\release\network_rules.exe delete
 ```
 
-`192.0.2.10` is an example IP address for documentation purposes.
+`list portproxy` reads IPv4-to-IPv4 TCP forwarding entries. `list firewall` reads all firewall rules, including disabled, outgoing, and identically named rules. Listing does not change configuration or notify services. An empty list is successful. Exit codes are 0 for success, 1 for an operation error, and 2 for invalid arguments. Execution on non-Windows systems is unsupported; pure logic tests can run there with `cargo test`.
 
-List settings independently with a required target:
+## Behavior and verification
 
-```powershell
-.\build\Release\network_rules.exe list portproxy
-.\build\Release\network_rules.exe list firewall
-```
+PortProxy uses `HKLM\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp` and notifies `iphlpsvc` with `SERVICE_CONTROL_PARAMCHANGE`. The registry representation is an undocumented implementation detail and may change in Windows. The wildcard listener is stored as `*/8180`; deletion falls back to the older `0.0.0.0/8180` form. Malformed registry entries cause listing to report an error.
 
-`portproxy` lists IPv4-to-IPv4 TCP forwarding entries. `firewall` lists all
-firewall rules, including disabled, outgoing, and identically named rules.
-Listing only reads configuration and does not notify services. An empty list
-is successful; retrieval failures return exit code 1, and invalid arguments
-return 2.
+Existing listener or firewall names are rejected. If adding the firewall rule fails, the newly added PortProxy entry is removed on a best-effort basis. Deletion attempts both operations independently. This is not a transaction; notification success does not guarantee reachability. `iphlpsvc` must be running and the destination must be reachable. The listener accepts traffic on all IPv4 interfaces and the firewall rule applies to all profiles.
 
-## Verifying the Configuration Results
+On Windows, verify addition, both listings, deletion, and actual forwarding to the destination. These diagnostic commands can also help inspect the resulting configuration:
 
 ```cmd
 netsh interface portproxy show v4tov4
@@ -63,23 +39,4 @@ netsh advfirewall firewall show rule name=all
 netstat -ano | findstr :8180
 ```
 
-## Important Notes
-
-- The registry format for PortProxy is not a publicly documented management API; it is an implementation-dependent format determined by ProcMon. Compatibility after Windows updates is not guaranteed.
-- Modifies `HKLM\SYSTEM\CurrentControlSet\Services\PortProxy\v4tov4\tcp` using `RegSetValueExW` / `RegDeleteValueW` and sends `SERVICE_CONTROL_PARAMCHANGE` to `iphlpsvc`.
-- Normalizes `listenaddress=0.0.0.0` as the value name `*/8180`. During deletion, it also treats the older manual configuration `0.0.0.0/8180` as a fallback.
-- `INetFwRules::Add` may overwrite rules with the same name; therefore, this implementation throws an exception if an existing name is detected using `Item`. Consequently, it does not behave identically to `netsh add` if an existing rule is present.
-- IPv4 addresses are supported only in numerical representation (`netsh`'s support for hostnames is not supported). The port range is 1 to 65535.
-- There is no complete transaction spanning PortProxy and Firewall. If adding the Firewall rule fails, the PortProxy created immediately before is deleted on a best-effort basis. Deletion is attempted independently for both.
-- The success of `ControlService` indicates that the notification to the service was successful, but does not guarantee connectivity. `iphlpsvc` must be running, and the destination must be reachable.
-- The rule allows inbound TCP traffic on port 8180 for all profiles and listens on all IPv4 interfaces. This makes it accessible from outside, so consider restricting the source address in a production environment.
-- This sample has not been verified by building and running on Windows.
-
-## References
-
-- [Microsoft: netsh interface portproxy](https://learn.microsoft.com/windows-server/networking/technologies/netsh/netsh-interface-portproxy)
-- [Microsoft: ControlService](https://learn.microsoft.com/windows/win32/api/winsvc/nf-winsvc-controlservice)
-- [Microsoft: INetFwRules::Add](https://learn.microsoft.com/windows/win32/api/netfw/nf-netfw-inetfwrules-add)
-- [Microsoft: INetFwRules::Remove](https://learn.microsoft.com/windows/win32/api/netfw/nf-netfw-inetfwrules-remove)
-- [Microsoft: Windows Firewall C++ sample](https://github.com/microsoft/Windows-classic-samples/tree/main/Samples/Win7Samples/security/windowsfirewall)
-- [Independent reverse engineering of PortProxy / iphlpsvc](https://adepts.of0x.cc/netsh-portproxy-code/)
+Windows build and live forwarding verification have not been performed in the Linux development environment.
