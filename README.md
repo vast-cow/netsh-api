@@ -13,7 +13,7 @@ netsh advfirewall firewall delete rule name="proxy forward"
 
 - `WindowsNetworkConfig.h`: `INetworkConfiguration` abstract interface and configuration model
 - `WindowsNetworkConfig.cpp`: Implementation using Win32 Registry API, SCM API, and Windows Firewall COM API
-- `main.cpp`: Example of executing `add` and `delete`
+- `main.cpp`: Command-line interface for `add`, `delete`, and `list`
 - `CMakeLists.txt`: Build definition for Windows / MSVC
 
 ## Build
@@ -42,11 +42,24 @@ In a terminal with **administrator privileges**, replace the destination with th
 
 `192.0.2.10` is an example IP address for documentation purposes.
 
+List settings independently with a required target:
+
+```powershell
+.\build\Release\network_rules.exe list portproxy
+.\build\Release\network_rules.exe list firewall
+```
+
+`portproxy` lists IPv4-to-IPv4 TCP forwarding entries. `firewall` lists all
+firewall rules, including disabled, outgoing, and identically named rules.
+Listing only reads configuration and does not notify services. An empty list
+is successful; retrieval failures return exit code 1, and invalid arguments
+return 2.
+
 ## Verifying the Configuration Results
 
 ```cmd
 netsh interface portproxy show v4tov4
-netsh advfirewall firewall show rule name="proxy forward"
+netsh advfirewall firewall show rule name=all
 netstat -ano | findstr :8180
 ```
 

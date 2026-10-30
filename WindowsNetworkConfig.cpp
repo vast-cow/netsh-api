@@ -16,7 +16,9 @@
 #include <netfw.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <iomanip>
+#include <vector>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -174,8 +176,154 @@ Microsoft::WRL::ComPtr<INetFwRules> GetFirewallRules() {
     return rules;
 }
 
+std::string Utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(),
+        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (!size) return "<unrepresentable value name>";
+    std::string result(size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                        result.data(), size, nullptr, nullptr);
+    return result;
+}
+
+void ParseEndpoint(const std::wstring& endpoint, std::wstring& address,
+                   std::uint16_t& port) {
+    if (endpoint.find(L'\0') != std::wstring::npos)
+        throw std::invalid_argument("invalid endpoint");
+    const auto slash = endpoint.find(L'/');
+    if (slash == std::wstring::npos || slash == 0 || slash + 1 == endpoint.size() ||
+        endpoint.find(L'/', slash + 1) != std::wstring::npos) {
+        throw std::invalid_argument("invalid endpoint");
+    }
+    address = endpoint.substr(0, slash);
+    if (address == L"*") address = L"0.0.0.0";
+    RequireIPv4(address);
+    unsigned int number = 0;
+    for (const wchar_t c : endpoint.substr(slash + 1)) {
+        if (c < L'0' || c > L'9') throw std::invalid_argument("invalid port");
+        number = number * 10 + (c - L'0');
+        if (number > 65535) throw std::invalid_argument("invalid port");
+    }
+    if (!number) throw std::invalid_argument("invalid port");
+    port = static_cast<std::uint16_t>(number);
+}
+
+class Variant final {
+public:
+    Variant() { VariantInit(&value); }
+    ~Variant() { VariantClear(&value); }
+    Variant(const Variant&) = delete;
+    Variant& operator=(const Variant&) = delete;
+    VARIANT value;
+};
+
+std::wstring ReadRuleString(INetFwRule* rule,
+                            HRESULT (STDMETHODCALLTYPE INetFwRule::*getter)(BSTR*),
+                            const char* operation) {
+    BSTR value = nullptr;
+    const HRESULT hr = (rule->*getter)(&value);
+    // Some implementations may return a BSTR even on failure.
+    std::unique_ptr<wchar_t, decltype(&SysFreeString)> owned(value, &SysFreeString);
+    CheckHresult(hr, operation);
+    return value ? std::wstring(value, SysStringLen(value)) : std::wstring();
+}
+
 class WindowsNetworkConfiguration final : public INetworkConfiguration {
 public:
+    std::vector<PortProxyV4ToV4> ListPortProxies() override {
+        HKEY raw_key = nullptr;
+        const LONG opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kPortProxyKey, 0,
+                                          KEY_QUERY_VALUE, &raw_key);
+        if (opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND) return {};
+        CheckWin32(opened, "RegOpenKeyExW(PortProxy)");
+        RegistryKey key(raw_key);
+        std::vector<PortProxyV4ToV4> result;
+        std::vector<wchar_t> name(256), data(256);
+        for (DWORD index = 0;; ++index) {
+            DWORD name_length, data_bytes, type;
+            LONG status;
+            for (;;) {
+                name_length = static_cast<DWORD>(name.size());
+                data_bytes = static_cast<DWORD>(data.size() * sizeof(wchar_t));
+                status = RegEnumValueW(key.Get(), index, name.data(), &name_length,
+                                       nullptr, &type, reinterpret_cast<BYTE*>(data.data()),
+                                       &data_bytes);
+                if (status != ERROR_MORE_DATA) break;
+                // RegEnumValueW may not report the required name size on overflow.
+                name.resize(std::max(name.size() * 2, static_cast<size_t>(name_length) + 1));
+                data.resize(std::max(data.size() * 2,
+                    (static_cast<size_t>(data_bytes) + sizeof(wchar_t) - 1) / sizeof(wchar_t)));
+            }
+            if (status == ERROR_NO_MORE_ITEMS) break;
+            CheckWin32(status, "RegEnumValueW(PortProxy)");
+            const std::wstring value_name(name.data(), name_length);
+            try {
+                if (type != REG_SZ || data_bytes < sizeof(wchar_t) ||
+                    data_bytes % sizeof(wchar_t) != 0 ||
+                    data[data_bytes / sizeof(wchar_t) - 1] != L'\0') {
+                    throw std::invalid_argument("invalid registry value type or data");
+                }
+                const std::wstring value_data(data.data(), data_bytes / sizeof(wchar_t) - 1);
+                PortProxyV4ToV4 rule;
+                ParseEndpoint(value_name, rule.listen_address, rule.listen_port);
+                ParseEndpoint(value_data, rule.connect_address, rule.connect_port);
+                result.push_back(std::move(rule));
+            } catch (const std::invalid_argument& error) {
+                throw std::runtime_error("Invalid PortProxy value '" + Utf8(value_name) +
+                                         "': " + error.what());
+            }
+        }
+        return result;
+    }
+
+    std::vector<FirewallRuleInfo> ListFirewallRules() override {
+        ComApartment com;
+        const auto rules = GetFirewallRules();
+        Microsoft::WRL::ComPtr<IUnknown> unknown;
+        CheckHresult(rules->get__NewEnum(unknown.GetAddressOf()), "INetFwRules::get__NewEnum");
+        Microsoft::WRL::ComPtr<IEnumVARIANT> enumerator;
+        CheckHresult(unknown.As(&enumerator), "QueryInterface(IEnumVARIANT)");
+        std::vector<FirewallRuleInfo> result;
+        for (;;) {
+            Variant item;
+            ULONG fetched = 0;
+            const HRESULT hr = enumerator->Next(1, &item.value, &fetched);
+            CheckHresult(hr, "IEnumVARIANT::Next");
+            if (fetched == 0) break;
+            if (item.value.vt != VT_DISPATCH || !item.value.pdispVal)
+                throw std::runtime_error("Invalid firewall enumeration item");
+            Microsoft::WRL::ComPtr<INetFwRule> rule;
+            CheckHresult(item.value.pdispVal->QueryInterface(IID_PPV_ARGS(rule.GetAddressOf())),
+                         "QueryInterface(INetFwRule)");
+            FirewallRuleInfo info;
+            info.name = ReadRuleString(rule.Get(), &INetFwRule::get_Name, "INetFwRule::get_Name");
+            VARIANT_BOOL enabled;
+            CheckHresult(rule->get_Enabled(&enabled), "INetFwRule::get_Enabled");
+            info.enabled = enabled != VARIANT_FALSE;
+            NET_FW_RULE_DIRECTION direction;
+            NET_FW_ACTION action;
+            CheckHresult(rule->get_Direction(&direction), "INetFwRule::get_Direction");
+            CheckHresult(rule->get_Action(&action), "INetFwRule::get_Action");
+            info.direction = direction;
+            info.action = action;
+            CheckHresult(rule->get_Protocol(&info.protocol), "INetFwRule::get_Protocol");
+            CheckHresult(rule->get_Profiles(&info.profiles), "INetFwRule::get_Profiles");
+            info.local_addresses = ReadRuleString(rule.Get(), &INetFwRule::get_LocalAddresses, "INetFwRule::get_LocalAddresses");
+            info.remote_addresses = ReadRuleString(rule.Get(), &INetFwRule::get_RemoteAddresses, "INetFwRule::get_RemoteAddresses");
+            info.application = ReadRuleString(rule.Get(), &INetFwRule::get_ApplicationName, "INetFwRule::get_ApplicationName");
+            info.service = ReadRuleString(rule.Get(), &INetFwRule::get_ServiceName, "INetFwRule::get_ServiceName");
+            if (info.protocol == NET_FW_IP_PROTOCOL_TCP || info.protocol == NET_FW_IP_PROTOCOL_UDP) {
+                info.local_ports = ReadRuleString(rule.Get(), &INetFwRule::get_LocalPorts, "INetFwRule::get_LocalPorts");
+                info.remote_ports = ReadRuleString(rule.Get(), &INetFwRule::get_RemotePorts, "INetFwRule::get_RemotePorts");
+            }
+            if (info.protocol == 1 || info.protocol == 58)
+                info.icmp_types_and_codes = ReadRuleString(rule.Get(), &INetFwRule::get_IcmpTypesAndCodes, "INetFwRule::get_IcmpTypesAndCodes");
+            result.push_back(std::move(info));
+        }
+        return result;
+    }
+
     void AddPortProxy(const PortProxyV4ToV4& rule) override {
         RequirePort(rule.listen_port);
         RequirePort(rule.connect_port);
